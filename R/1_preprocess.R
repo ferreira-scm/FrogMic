@@ -41,25 +41,26 @@ errR <- learnErrors(filtRs, multithread=TRUE)
 dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
 dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
 mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
-#
+
 head(mergers[[1]])
 #make sequence table
 seqtab <- makeSequenceTable(mergers)
 dim(seqtab)
 table(nchar(getSequences(seqtab)))
-#
+
 ## remove chimeras
-#
+
 seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
 dim(seqtab.nochim)
 sum(seqtab.nochim)/sum(seqtab)
+
 # sanity check
 getN <- function(x) sum(getUniques(x))
 track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
 colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
 rownames(track) <- sample.names
 head(track)
-#
+
 ## assigning taxonomy to silva
 taxa <- assignTaxonomy(seqtab.nochim, "/SAN/Susanas_den/AmpMarkers/RESCRIPt/SSURef_NR99/Fastas/Slv138.dada2.fa", multithread=TRUE)
 
@@ -68,35 +69,97 @@ rownames(taxa.print) <- NULL
 head(taxa.print)
 
 # load metadata
-metadata <- read.csv("data/FG23-metadata_clean.csv")
+metadata <- read.csv("data/dataframe_2023_clean.csv")
 
-head(metadata)
+metadata$Sample_ID
+
+metadata$Lab_ID
 
 rownames(metadata) <- metadata$Lab_ID
+
+rownames(seqtab.nochim)[!metadata$Lab_ID %in% rownames(seqtab.nochim)]
+
+rownames(seqtab.nochim)[!rownames(seqtab.nochim)%in% metadata$Lab_ID]
+
+nrow(seqtab.nochim)
 
 ## handover to phyloseq
 PS <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE),
                sample_data(metadata),
                tax_table(taxa))
 
-
-
 PS
 
-sample_names(PS)
+all(sample_names(PS)==rownames(PS@sam_data))
 
 summary(as.factor(PS@sam_data$State))
 
-# a new column with the info on the controls
-PS_neg <- subset_samples(PS, grepl("NTC",rownames(PS@otu_table)))   
+######### remove contaminants
+### Removing contaminants
+library("decontam")
+
+
+PS_neg <- subset_samples(PS, grepl("NTC",rownames(PS@otu_table)))
+
 PS@sam_data$Control <- FALSE
+
+
 PS@sam_data$Control[which(sample_names(PS)%in%sample_names(PS_neg))] <- TRUE
 
 # sanity check
 PS@sam_data$Lab_ID[PS@sam_data$Control==FALSE]
 rownames(PS@sam_data)[PS@sam_data$Control==TRUE]
+
+## ----see-depths---------------------------------------------------------------
+df <- as.data.frame(sample_data(PS)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(PS)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Control)) + geom_point()
+
+contamdf.freq <- isContaminant(PS, method="prevalence", neg="Control", threshold=c(0.1), normalize=TRUE)
+
+table(contamdf.freq$contaminant)
+
+### taxa to remove
+PS@tax_table[rownames(contamdf.freq[contamdf.freq$contaminant==TRUE,]),5]
+
+## let's remove them now and negative controls
+Keep <- rownames(contamdf.freq[contamdf.freq$contaminant==FALSE,])
+PS <- prune_samples(sample_data(PS)$Control == FALSE, PS)
+PS <- prune_taxa(Keep, PS)
+
+
+# sanity check
+PS@sam_data$Lab_ID[PS@sam_data$Control==FALSE]
+rownames(PS@sam_data)[PS@sam_data$Control==TRUE]
+
 # removing ugly handlers
 tax_table(PS)[, colnames(tax_table(PS))] <- gsub(tax_table(PS)[, colnames(tax_table(PS))], pattern="[a-z]__", replacement="")
+
+PS
+
+### quality filtering: removing low prevalent taxa (less than 5%)
+x = phyloseq::taxa_sums(PS)
+
+# remove singletons (prevalnce filter bellow 3%)
+KeepTaxap <- microbiome::prevalence(PS)>0.03
+
+PS <- phyloseq::prune_taxa(KeepTaxap, PS)
+
+PS
+
+summary(sample_sums(PS)) # library size
+
+# adjust taxonomy
+PS@tax_table[which(is.na(PS@tax_table[,2])),2] <- "Unknown_phylum"
+tax <- as.data.frame(tax_table(PS))
+tax[is.na(tax$Genus),]$Genus <- paste0("Unknown_genus_in_",tax[is.na(tax$Genus),]$Family)
+tax[which(tax$Genus=="Unknown_genus_in_NA"),]$Genus<-paste0("Unknown_genus_in_",tax[which(tax$Genus=="Unknown_genus_in_NA"),]$Order)
+tax[which(tax$Genus=="Unknown_genus_in_NA"),]$Genus<-paste0("Unknown_genus_in_",tax[which(tax$Genus=="Unknown_genus_in_NA"),]$Class)
+tax[which(tax$Genus=="Unknown_genus_in_NA"),]$Genus<-paste0("Unknown_genus_in_",tax[which(tax$Genus=="Unknown_genus_in_NA"),]$Phylum)
+PS@tax_table <-tax_table(as.matrix(tax))
 
 
 saveRDS(PS, file="tmp/Phyloseq_f.RDS")
